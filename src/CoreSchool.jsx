@@ -3,6 +3,43 @@ import React, { useState, useEffect, useRef } from "react";
 /* ── helpers ── */
 const cx = (...args) => args.filter(Boolean).join(" ");
 
+/* Network helper: exponential backoff with jitter for 429s */
+async function fetchWithBackoff(url, opts = {}, retries = 5, baseDelay = 500) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, opts);
+      if (res.status !== 429) return res;
+      // 429 received: respect Retry-After if present
+      const retryAfter = res.headers.get && res.headers.get('Retry-After');
+      if (retryAfter) {
+        const waitMs = Number(retryAfter) * 1000;
+        await new Promise(r => setTimeout(r, waitMs));
+      } else {
+        const jitter = Math.random() * 100;
+        const waitMs = baseDelay * (2 ** attempt) + jitter;
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+    } catch (err) {
+      // Network error: retry unless last attempt
+      if (attempt === retries) throw err;
+      const jitter = Math.random() * 200;
+      const waitMs = baseDelay * (2 ** attempt) + jitter;
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+  throw new Error('Max retries reached for ' + url);
+}
+
+async function fetchJsonWithBackoff(url, opts = {}, retries = 5) {
+  const res = await fetchWithBackoff(url, opts, retries);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`Request failed: ${res.status} ${res.statusText} ${text}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
 /* ── static data ── */
 const MARKS = [
   { sub: "Mathematics", mark: 88, grade: "A+", color: "#16a34a" },
@@ -662,9 +699,37 @@ function Record() {
 }
 
 function AI() {
+  const [insights, setInsights] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [aiError, setAiError] = useState(null);
+
+  useEffect(() => {
+    let mounted = true;
+    async function load() {
+      setLoading(true);
+      setAiError(null);
+      try {
+        if (typeof window === 'undefined') return;
+        const data = await fetchJsonWithBackoff('/api/ai/insights', { method: 'GET' }, 3);
+        if (mounted) setInsights(data);
+      } catch (err) {
+        console.warn('AI fetch failed', err);
+        if (mounted) setAiError(err.message || String(err));
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    }
+    load();
+    return () => { mounted = false; };
+  }, []);
+
   return (
     <div>
       <PageHero title="AI Insights Engine" sub="Powered by machine learning · Predictions updated daily" />
+      {loading && <Card style={{ marginBottom: 12 }}><div style={{ padding: 12 }}>Loading AI insights…</div></Card>}
+      {aiError && <Card style={{ marginBottom: 12 }}><AlertItem icon="⚠️" iconVariant="red" title="AI service unavailable" desc={aiError} /></Card>}
+      {/* If `insights` exists you can render it here; otherwise show the static dashboard below as fallback */}
+      {insights && <Card style={{ marginBottom: 12 }}><pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>{JSON.stringify(insights, null, 2)}</pre></Card>}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 20 }}>
         <StatCard color="blue" label="At-risk Students" value="23" sub="Need intervention now" />
         <StatCard color="amber" label="Dropout Risk" value="7" sub="High probability flag" />
@@ -929,10 +994,23 @@ function LoginPanel({ onLogin, onQuickLogin }) {
 export default function CoreSchool() {
   const [active, setActive] = useState("dashboard");
   const [user, setUser] = useState(() => {
-    try { const raw = localStorage.getItem('cs_user'); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+    try {
+      if (typeof window === 'undefined' || !window.localStorage) return null;
+      const raw = window.localStorage.getItem('cs_user');
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
   });
 
-  useEffect(() => { if (user) localStorage.setItem('cs_user', JSON.stringify(user)); }, [user]);
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        if (user) window.localStorage.setItem('cs_user', JSON.stringify(user));
+        else window.localStorage.removeItem('cs_user');
+      }
+    } catch (e) { /* ignore storage errors */ }
+  }, [user]);
 
   const Page = PAGES[active];
 
@@ -956,7 +1034,7 @@ export default function CoreSchool() {
 
   function logout() {
     setUser(null);
-    localStorage.removeItem('cs_user');
+    try { if (typeof window !== 'undefined' && window.localStorage) window.localStorage.removeItem('cs_user'); } catch (e) {}
     setActive('dashboard');
   }
 
